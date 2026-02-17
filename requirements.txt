@@ -1,2 +1,7 @@
 - yfinance
 - pytest
+- pandas
+- pytorch
+- lxml
+- numpy
+- matplotlib
