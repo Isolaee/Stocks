@@ -1,10 +1,59 @@
 Small ML project with stock data
 
-Stages
+## Stages
 1. Define most effective metrics - DONE
-2. Create derivates
-3. Train model
+2. Create derivatives - DONE
+3. Train model - DONE
 4. Test model with examples
+
+## Project Structure
+
+| File | Purpose |
+|------|---------|
+| `fetchData.py` | Downloads S&P 500 daily OHLCV history to `sp500_history.csv` |
+| `dataCoefficent.py` | Builds features for top 100 stocks, computes Spearman correlations |
+| `preprocess.py` | Feature engineering, normalization, 30-day sliding windows, chronological train/val/test split |
+| `model.py` | PyTorch Dataset, LSTM+Transformer hybrid model, training loop with early stopping |
+| `displayData.py` | Data visualization |
+
+## How to Run
+
+```bash
+# 1. Fetch data (takes a while, downloads all S&P 500 history)
+python fetchData.py
+
+# 2. Train the model
+python model.py
+```
+
+Training outputs `model_weights.pth` which can be loaded for predictions:
+```python
+from model import StockPredictor
+import torch
+
+model = StockPredictor()
+model.load_state_dict(torch.load("model_weights.pth"))
+model.eval()
+```
+
+## Model Architecture
+
+LSTM + Transformer hybrid predicting two regression targets:
+- **Close return** — next-day % change in close price
+- **Dividend yield** — next-day dividend / close price
+
+Pipeline: `Input (30 days x 11 features) → Linear projection → 2-layer LSTM → Positional encoding → 2-layer Transformer encoder (4 heads) → Regression head → 2 outputs`
+
+### Input Features (selected via correlation analysis)
+MA 50/200 Ratio, Momentum 30d, Momentum 10d, RSI 14, Daily Return, Volatility 20d, Volume Ratio, High-Low Spread, Close-Open Spread, Upper Shadow, Lower Shadow
+
+### Training Configuration
+- Loss: MSE (regression)
+- Batch size: 64
+- Optimizer: Adam with weight decay
+- LR scheduler: ReduceLROnPlateau
+- Early stopping: patience 10
+- Gradient clipping: max norm 1.0
 
 ## Stage 1: Correlation Analysis
 
@@ -23,3 +72,24 @@ Analyzed Spearman rank correlations across the top 100 US stocks by market cap t
 ### Output files
 - `corr_close_avg.csv` — averaged correlations vs Close price
 - `corr_dividends_avg.csv` — averaged correlations vs Dividends
+
+## How to Improve Model Accuracy
+
+### Data improvements
+- **Add more features** — MACD, Bollinger Bands, ATR, OBV (On-Balance Volume), sector one-hot encoding. More diverse signals give the model more to learn from.
+- **Add external data** — market-wide indicators (VIX, S&P 500 index return, treasury yields, Fed funds rate) as context features. Individual stocks don't move in isolation.
+- **Increase window size** — try 60 or 90 days instead of 30. Longer context may capture slower-moving patterns, especially for dividend prediction.
+- **Target engineering** — predict 5-day or 20-day returns instead of single-day. Longer horizons have higher signal-to-noise ratio and are more practically useful.
+
+### Model improvements
+- **Weighted loss** — dividend yield is mostly zeros (non-dividend days). Use a weighted MSE that penalizes dividend errors more heavily, or train separate heads with separate losses.
+- **Larger model** — increase `d_model` (64 → 128 or 256), add more transformer layers, or add more LSTM layers. Only do this if validation loss is still decreasing when early stopping triggers.
+- **Attention masking** — add causal masking to the transformer so it can only attend to past timesteps, matching the real-world constraint.
+- **Ensemble** — train multiple models with different random seeds or hyperparameters and average their predictions. Simple ensembling often gives 5-15% error reduction.
+
+### Training improvements
+- **Learning rate warmup** — use a linear warmup for the first few epochs before the cosine/plateau schedule. Transformers are sensitive to high initial learning rates.
+- **Huber loss** — replace MSE with `nn.SmoothL1Loss()`. It's less sensitive to outlier returns (earnings days, crashes) which can dominate MSE.
+- **Walk-forward validation** — instead of a single train/val/test split, use rolling windows: train on months 1-12, validate on 13, slide forward. This tests robustness across market regimes.
+- **GPU training** — install PyTorch with CUDA support for 10-50x faster training, allowing more hyperparameter experiments.
+- **Hyperparameter search** — use Optuna or Ray Tune to systematically search learning rate, dropout, d_model, window size, and number of layers.
