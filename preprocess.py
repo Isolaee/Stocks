@@ -38,7 +38,9 @@ WINDOW_SIZE = 90
 
 def load_macro(macro_path="macro_history.csv"):
     """Load macro indicator CSV (VIX, SP500_Return, Treasury_10Y, USD_Index)."""
-    macro = pd.read_csv(macro_path, parse_dates=["Date"], index_col="Date")
+    macro = pd.read_csv(macro_path)
+    macro["Date"] = pd.to_datetime(macro["Date"], utc=True)
+    macro = macro.set_index("Date")
     # Ensure no gaps — forward-fill missing trading days
     macro = macro.ffill()
     return macro

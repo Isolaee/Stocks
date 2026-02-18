@@ -328,7 +328,7 @@ if __name__ == "__main__":
     splits, scalers = prepare_data()
 
     print("\n[2/3] Training model...")
-    model = train_model(splits, batch_size=64, epochs=100, patience=10)
+    model = train_model(splits, batch_size=32, epochs=100, patience=10)
 
     print("\n[3/3] Evaluating on test set...")
     results = evaluate(model, splits)
