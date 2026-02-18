@@ -23,7 +23,7 @@ class StockDataset(Dataset):
         """
         Args:
             X: np.ndarray (num_samples, window_size, num_features)
-            y: np.ndarray (num_samples, 2) — [close_return, dividend_yield]
+            y: np.ndarray (num_samples, 2) — [6mo_close_return, 6mo_dividend_yield]
         """
         self.X = torch.tensor(X, dtype=torch.float32)
         self.y = torch.tensor(y, dtype=torch.float32)
@@ -310,7 +310,7 @@ def evaluate(model, splits, device=None):
     print(f"  Close return MSE:       {mse_close:.8f}")
     print(f"  Dividend yield MSE:     {mse_div:.10f}")
     print(f"  Direction accuracy:     {dir_accuracy:.2%}")
-    print(f"  (Baseline ~50% for random, ~53% for always-up)")
+    print(f"  (Baseline ~50% for random, higher for always-up over 6mo horizon)")
 
     return {"mse_close": mse_close, "mse_div": mse_div, "dir_accuracy": dir_accuracy}
 

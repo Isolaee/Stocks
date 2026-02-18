@@ -6,6 +6,7 @@ from sklearn.preprocessing import MinMaxScaler
 # Features selected based on correlation analysis (corr_close_avg.csv)
 # Excluded: Cumulative Return (derived from target), Open/High/Low (too correlated with Close)
 FEATURE_COLS = [
+    # Per-stock technical
     "MA 50/200 Ratio",
     "Momentum 30d",
     "Momentum 10d",
@@ -17,14 +18,36 @@ FEATURE_COLS = [
     "Close-Open Spread",
     "Upper Shadow",
     "Lower Shadow",
+    "MACD",
+    "MACD Signal",
+    "Bollinger %B",
+    "Bollinger Width",
+    "ATR 14",
+    "OBV Change 20d",
+    # External macro (merged by date)
+    "VIX",
+    "SP500_Return",
+    "Treasury_10Y",
+    "USD_Index",
 ]
 
-WINDOW_SIZE = 30
+MACRO_COLS = ["VIX", "SP500_Return", "Treasury_10Y", "USD_Index"]
+
+WINDOW_SIZE = 90
 
 
-def load_and_enrich(csv_path="sp500_history.csv"):
-    """Load raw CSV and add derived features per stock."""
+def load_macro(macro_path="macro_history.csv"):
+    """Load macro indicator CSV (VIX, SP500_Return, Treasury_10Y, USD_Index)."""
+    macro = pd.read_csv(macro_path, parse_dates=["Date"], index_col="Date")
+    # Ensure no gaps — forward-fill missing trading days
+    macro = macro.ffill()
+    return macro
+
+
+def load_and_enrich(csv_path="sp500_history.csv", macro_path="macro_history.csv"):
+    """Load raw CSV, add derived features per stock, and merge macro data."""
     df = pd.read_csv(csv_path, parse_dates=["Date"])
+    macro = load_macro(macro_path)
     enriched = []
 
     for symbol, group in df.groupby("Symbol"):
@@ -53,34 +76,78 @@ def load_and_enrich(csv_path="sp500_history.csv"):
             raw=False,
         )
 
-        # Regression targets
-        # Target 1: next-day close % return
-        g["Target_Close"] = g["Close"].pct_change().shift(-1)
-        # Target 2: next-day dividend yield (dividend / close price, 0 on non-dividend days)
-        g["Target_Dividend"] = (g["Dividends"].shift(-1) / g["Close"]).fillna(0.0)
+        # MACD (EMA12 - EMA26) and Signal line (EMA9 of MACD)
+        ema12 = g["Close"].ewm(span=12).mean()
+        ema26 = g["Close"].ewm(span=26).mean()
+        g["MACD"] = ema12 - ema26
+        g["MACD Signal"] = g["MACD"].ewm(span=9).mean()
+
+        # Bollinger Bands (20-day)
+        bb_ma = g["Close"].rolling(20).mean()
+        bb_std = g["Close"].rolling(20).std()
+        g["Bollinger %B"] = (g["Close"] - (bb_ma - 2 * bb_std)) / (4 * bb_std)
+        g["Bollinger Width"] = (4 * bb_std) / bb_ma
+
+        # ATR 14 (Average True Range)
+        tr = pd.concat([
+            g["High"] - g["Low"],
+            (g["High"] - g["Close"].shift(1)).abs(),
+            (g["Low"] - g["Close"].shift(1)).abs(),
+        ], axis=1).max(axis=1)
+        g["ATR 14"] = tr.rolling(14).mean()
+
+        # OBV % change (20-day rate of change of On-Balance Volume)
+        signed_vol = g["Volume"].where(g["Close"].diff() > 0, -g["Volume"])
+        signed_vol = signed_vol.where(g["Close"].diff() != 0, 0)
+        obv = signed_vol.cumsum()
+        g["OBV Change 20d"] = obv.pct_change(20)
+
+        # Regression targets — 6-month (126 trading days) forward-looking
+        # Target 1: 6-month forward close % return
+        g["Target_Close"] = g["Close"].shift(-126) / g["Close"] - 1
+        # Target 2: 6-month cumulative dividend yield (sum of next 126 days' dividends / current close)
+        g["Target_Dividend"] = (
+            g["Dividends"].rolling(126, min_periods=1).sum().shift(-126) / g["Close"]
+        ).fillna(0.0)
 
         enriched.append(g)
 
-    return pd.concat(enriched, ignore_index=True)
+    df = pd.concat(enriched, ignore_index=True)
+
+    # Merge macro indicators by date
+    df = df.merge(macro, left_on="Date", right_index=True, how="left")
+    for col in MACRO_COLS:
+        df[col] = df[col].ffill()
+
+    return df
 
 
-def normalize_features(df, feature_cols=FEATURE_COLS):
-    """Normalize features per stock using MinMaxScaler.
+def normalize_features(df, feature_cols=FEATURE_COLS, macro_cols=MACRO_COLS):
+    """Normalize features: per-stock for technical indicators, globally for macro.
 
     Returns the DataFrame with normalized feature columns and
-    a dict of {symbol: fitted_scaler} for inverse transforms later.
+    a dict of {symbol: fitted_scaler, "__macro__": macro_scaler} for inverse transforms.
     """
     scalers = {}
+    stock_cols = [c for c in feature_cols if c not in macro_cols]
 
+    # Per-stock normalization for technical indicators
     for symbol, group in df.groupby("Symbol"):
-        subset = group[feature_cols]
+        subset = group[stock_cols]
         # Skip stocks where any feature column is entirely NaN
         if subset.isna().all().any():
             df = df.drop(group.index)
             continue
         scaler = MinMaxScaler()
-        df.loc[group.index, feature_cols] = scaler.fit_transform(subset)
+        df.loc[group.index, stock_cols] = scaler.fit_transform(subset)
         scalers[symbol] = scaler
+
+    # Global normalization for macro features (same values across all stocks on a given date)
+    present_macro = [c for c in macro_cols if c in df.columns]
+    if present_macro:
+        macro_scaler = MinMaxScaler()
+        df[present_macro] = macro_scaler.fit_transform(df[present_macro])
+        scalers["__macro__"] = macro_scaler
 
     return df, scalers
 
@@ -141,13 +208,13 @@ def train_val_test_split(X, y, meta, train_ratio=0.7, val_ratio=0.15):
     return splits
 
 
-def prepare_data(csv_path="sp500_history.csv"):
-    """Full pipeline: load → enrich → normalize → window → split.
+def prepare_data(csv_path="sp500_history.csv", macro_path="macro_history.csv"):
+    """Full pipeline: load → enrich → merge macro → normalize → window → split.
 
     Returns dict with train/val/test splits, each containing (X, y, meta).
     """
     print("Loading and enriching data...")
-    df = load_and_enrich(csv_path)
+    df = load_and_enrich(csv_path, macro_path)
 
     print("Normalizing features...")
     df, scalers = normalize_features(df)

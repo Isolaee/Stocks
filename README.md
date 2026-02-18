@@ -75,12 +75,6 @@ Analyzed Spearman rank correlations across the top 100 US stocks by market cap t
 
 ## How to Improve Model Accuracy
 
-### Data improvements
-- **Add more features** — MACD, Bollinger Bands, ATR, OBV (On-Balance Volume), sector one-hot encoding. More diverse signals give the model more to learn from.
-- **Add external data** — market-wide indicators (VIX, S&P 500 index return, treasury yields, Fed funds rate) as context features. Individual stocks don't move in isolation.
-- **Increase window size** — try 60 or 90 days instead of 30. Longer context may capture slower-moving patterns, especially for dividend prediction.
-- **Target engineering** — predict 5-day or 20-day returns instead of single-day. Longer horizons have higher signal-to-noise ratio and are more practically useful.
-
 ### Model improvements
 - **Weighted loss** — dividend yield is mostly zeros (non-dividend days). Use a weighted MSE that penalizes dividend errors more heavily, or train separate heads with separate losses.
 - **Larger model** — increase `d_model` (64 → 128 or 256), add more transformer layers, or add more LSTM layers. Only do this if validation loss is still decreasing when early stopping triggers.
