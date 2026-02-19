@@ -5,3 +5,5 @@ __pycache__/
 *.csv
 *.png
 *.pth
+checkpoints/
+data_chunks/

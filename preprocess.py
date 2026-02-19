@@ -1,3 +1,5 @@
+import os
+import pickle
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
@@ -48,7 +50,8 @@ def load_macro(macro_path="macro_history.csv"):
 
 def load_and_enrich(csv_path="sp500_history.csv", macro_path="macro_history.csv"):
     """Load raw CSV, add derived features per stock, and merge macro data."""
-    df = pd.read_csv(csv_path, parse_dates=["Date"])
+    df = pd.read_csv(csv_path)
+    df["Date"] = pd.to_datetime(df["Date"], utc=True)
     macro = load_macro(macro_path)
     enriched = []
 
@@ -115,6 +118,8 @@ def load_and_enrich(csv_path="sp500_history.csv", macro_path="macro_history.csv"
         enriched.append(g)
 
     df = pd.concat(enriched, ignore_index=True)
+    # Replace infinities from division-by-zero in feature engineering
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     # Merge macro indicators by date
     df = df.merge(macro, left_on="Date", right_index=True, how="left")
@@ -229,6 +234,250 @@ def prepare_data(csv_path="sp500_history.csv", macro_path="macro_history.csv"):
     splits = train_val_test_split(X, y, meta)
 
     return splits, scalers
+
+
+# ──────────────────────────────────────────────
+# Chunked pipeline for large datasets
+# ──────────────────────────────────────────────
+
+def _enrich_symbol_group(group):
+    """Compute derived features for a single stock group (same logic as load_and_enrich)."""
+    g = group.sort_values("Date").copy()
+
+    g["Daily Return"] = g["Close"].pct_change()
+    g["Volatility 20d"] = g["Daily Return"].rolling(20).std()
+    g["MA 50"] = g["Close"].rolling(50).mean()
+    g["MA 200"] = g["Close"].rolling(200).mean()
+    g["MA 50/200 Ratio"] = g["MA 50"] / g["MA 200"]
+    g["Volume MA 20"] = g["Volume"].rolling(20).mean()
+    g["Volume Ratio"] = g["Volume"] / g["Volume MA 20"]
+    g["High-Low Spread"] = g["High"] - g["Low"]
+    g["Close-Open Spread"] = g["Close"] - g["Open"]
+    g["Upper Shadow"] = g["High"] - g[["Close", "Open"]].max(axis=1)
+    g["Lower Shadow"] = g[["Close", "Open"]].min(axis=1) - g["Low"]
+    g["Momentum 10d"] = g["Close"] - g["Close"].shift(10)
+    g["Momentum 30d"] = g["Close"] - g["Close"].shift(30)
+    g["RSI 14"] = g["Daily Return"].rolling(14).apply(
+        lambda x: (
+            100 - 100 / (1 + x[x > 0].mean() / abs(x[x < 0].mean()))
+            if abs(x[x < 0].mean()) > 0
+            else 100
+        ),
+        raw=False,
+    )
+
+    ema12 = g["Close"].ewm(span=12).mean()
+    ema26 = g["Close"].ewm(span=26).mean()
+    g["MACD"] = ema12 - ema26
+    g["MACD Signal"] = g["MACD"].ewm(span=9).mean()
+
+    bb_ma = g["Close"].rolling(20).mean()
+    bb_std = g["Close"].rolling(20).std()
+    g["Bollinger %B"] = (g["Close"] - (bb_ma - 2 * bb_std)) / (4 * bb_std)
+    g["Bollinger Width"] = (4 * bb_std) / bb_ma
+
+    tr = pd.concat([
+        g["High"] - g["Low"],
+        (g["High"] - g["Close"].shift(1)).abs(),
+        (g["Low"] - g["Close"].shift(1)).abs(),
+    ], axis=1).max(axis=1)
+    g["ATR 14"] = tr.rolling(14).mean()
+
+    signed_vol = g["Volume"].where(g["Close"].diff() > 0, -g["Volume"])
+    signed_vol = signed_vol.where(g["Close"].diff() != 0, 0)
+    obv = signed_vol.cumsum()
+    g["OBV Change 20d"] = obv.pct_change(20)
+
+    g["Target_Close"] = g["Close"].shift(-126) / g["Close"] - 1
+    g["Target_Dividend"] = (
+        g["Dividends"].rolling(126, min_periods=1).sum().shift(-126) / g["Close"]
+    ).fillna(0.0)
+
+    return g
+
+
+def prepare_data_chunked(
+    csv_path="sp500_history.csv",
+    macro_path="macro_history.csv",
+    chunk_dir="data_chunks",
+    chunk_size=50,
+    train_ratio=0.7,
+    val_ratio=0.15,
+):
+    """Memory-efficient pipeline that processes symbols in chunks and saves to disk.
+
+    Args:
+        chunk_size: number of symbols to process at a time
+        chunk_dir: directory to store .npz chunk files
+
+    Returns:
+        splits: dict with train/val/test, each containing (X, y, meta)
+        scalers: dict of fitted scalers
+    """
+    os.makedirs(chunk_dir, exist_ok=True)
+
+    # Load macro data once (small)
+    macro = load_macro(macro_path)
+
+    # Read only the Symbol column to get the full list without loading everything
+    all_symbols = pd.read_csv(csv_path, usecols=["Symbol"])["Symbol"].unique()
+    symbol_chunks = [
+        all_symbols[i:i + chunk_size]
+        for i in range(0, len(all_symbols), chunk_size)
+    ]
+    print(f"Processing {len(all_symbols)} symbols in {len(symbol_chunks)} chunks of ~{chunk_size}...")
+
+    all_scalers = {}
+    chunk_files = []
+
+    for ci, symbols in enumerate(symbol_chunks):
+        print(f"  Chunk {ci + 1}/{len(symbol_chunks)} ({len(symbols)} symbols)...")
+
+        # Read only rows for this chunk's symbols
+        df_raw = pd.read_csv(csv_path)
+        df_raw["Date"] = pd.to_datetime(df_raw["Date"], utc=True)
+        df_chunk = df_raw[df_raw["Symbol"].isin(symbols)]
+        del df_raw
+
+        # Enrich each symbol
+        enriched = []
+        for symbol, group in df_chunk.groupby("Symbol"):
+            enriched.append(_enrich_symbol_group(group))
+        df_chunk = pd.concat(enriched, ignore_index=True)
+        df_chunk.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+        # Merge macro
+        df_chunk = df_chunk.merge(macro, left_on="Date", right_index=True, how="left")
+        for col in MACRO_COLS:
+            df_chunk[col] = df_chunk[col].ffill()
+
+        # Normalize (per-stock scalers + macro)
+        df_chunk, chunk_scalers = normalize_features(df_chunk)
+        all_scalers.update(chunk_scalers)
+
+        # Create windows
+        X, y, meta = create_windows(df_chunk)
+        if len(X) == 0:
+            continue
+
+        # Save chunk to disk
+        chunk_path = os.path.join(chunk_dir, f"chunk_{ci:03d}.npz")
+        np.savez(chunk_path, X=X, y=y)
+        # Save meta separately (contains Python objects)
+        meta_path = os.path.join(chunk_dir, f"chunk_{ci:03d}_meta.pkl")
+        with open(meta_path, "wb") as f:
+            pickle.dump(meta, f)
+        chunk_files.append((chunk_path, meta_path))
+
+        del df_chunk, X, y, meta, enriched
+
+    # ── Chronological split without loading all data into memory ──
+    # Step 1: Collect only dates + chunk/row indices from meta files
+    print("Collecting sample dates for chronological split...")
+    sample_refs = []  # (date, chunk_idx, row_idx)
+    chunk_sizes = []
+    for ci, (chunk_path, meta_path) in enumerate(chunk_files):
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+        chunk_sizes.append(len(meta))
+        for ri, m in enumerate(meta):
+            sample_refs.append((m["date"], ci, ri))
+
+    total_samples = len(sample_refs)
+    print(f"  Total samples: {total_samples:,}")
+
+    # Step 2: Sort by date and determine split boundaries
+    sample_refs.sort(key=lambda x: x[0])
+    train_end = int(total_samples * train_ratio)
+    val_end = int(total_samples * (train_ratio + val_ratio))
+
+    split_assignments = {"train": [], "val": [], "test": []}
+    for i, (date, ci, ri) in enumerate(sample_refs):
+        if i < train_end:
+            split_assignments["train"].append((ci, ri))
+        elif i < val_end:
+            split_assignments["val"].append((ci, ri))
+        else:
+            split_assignments["test"].append((ci, ri))
+
+    # Step 3: Write split .npy files by streaming chunks
+    # Use .npy (raw) format with memory-mapped writing for zero extra RAM
+    print("Writing split files to disk...")
+    n_features = len(FEATURE_COLS)
+    split_info = {}
+
+    for name, refs in split_assignments.items():
+        n = len(refs)
+        if n == 0:
+            continue
+
+        x_path = os.path.join(chunk_dir, f"{name}_X.npy")
+        y_path = os.path.join(chunk_dir, f"{name}_y.npy")
+
+        # Create memory-mapped files
+        X_mm = np.lib.format.open_memmap(
+            x_path, mode="w+", dtype=np.float32,
+            shape=(n, WINDOW_SIZE, n_features),
+        )
+        y_mm = np.lib.format.open_memmap(
+            y_path, mode="w+", dtype=np.float32,
+            shape=(n, 2),
+        )
+
+        # Group refs by chunk to minimize file reloads
+        from collections import defaultdict
+        chunk_to_rows = defaultdict(list)
+        for out_idx, (ci, ri) in enumerate(refs):
+            chunk_to_rows[ci].append((out_idx, ri))
+
+        for ci, row_pairs in chunk_to_rows.items():
+            data = np.load(chunk_files[ci][0])
+            chunk_X, chunk_y = data["X"], data["y"]
+            for out_idx, ri in row_pairs:
+                X_mm[out_idx] = chunk_X[ri]
+                y_mm[out_idx] = chunk_y[ri]
+            del data, chunk_X, chunk_y
+
+        X_mm.flush()
+        y_mm.flush()
+        del X_mm, y_mm
+
+        # Collect meta for this split
+        meta_list = []
+        for ci, ri in refs:
+            meta_list.append(sample_refs[0])  # placeholder — we need actual meta
+        # Reload meta properly
+        meta_list = []
+        all_chunk_meta = {}
+        for ci, ri in refs:
+            if ci not in all_chunk_meta:
+                with open(chunk_files[ci][1], "rb") as f:
+                    all_chunk_meta[ci] = pickle.load(f)
+            meta_list.append(all_chunk_meta[ci][ri])
+        all_chunk_meta.clear()
+
+        with open(os.path.join(chunk_dir, f"{name}_meta.pkl"), "wb") as f:
+            pickle.dump(meta_list, f)
+
+        split_info[name] = n
+        date_range = f"{meta_list[0]['date']} to {meta_list[-1]['date']}"
+        print(f"  {name}: {n:>8,} samples  ({date_range})")
+
+    # Save scalers
+    with open(os.path.join(chunk_dir, "scalers.pkl"), "wb") as f:
+        pickle.dump(all_scalers, f)
+
+    # Return paths instead of arrays — model.py will use MemmapDataset
+    splits = {}
+    for name in ["train", "val", "test"]:
+        x_path = os.path.join(chunk_dir, f"{name}_X.npy")
+        y_path = os.path.join(chunk_dir, f"{name}_y.npy")
+        meta_path = os.path.join(chunk_dir, f"{name}_meta.pkl")
+        with open(meta_path, "rb") as f:
+            meta = pickle.load(f)
+        splits[name] = (x_path, y_path, meta)
+
+    return splits, all_scalers
 
 
 if __name__ == "__main__":

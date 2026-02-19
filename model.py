@@ -1,10 +1,11 @@
 import math
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from preprocess import prepare_data, WINDOW_SIZE, FEATURE_COLS
+from preprocess import prepare_data, prepare_data_chunked, WINDOW_SIZE, FEATURE_COLS
 
 # Intra-op parallelism: use all cores for matrix ops (LSTM, attention, etc.)
 torch.set_num_threads(os.cpu_count() or 4)
@@ -33,6 +34,42 @@ class StockDataset(Dataset):
 
     def __getitem__(self, idx):
         return self.X[idx], self.y[idx]
+
+
+class MemmapDataset(Dataset):
+    """Reads samples directly from .npy files on disk via memory mapping.
+
+    Only the accessed batch pages are loaded into RAM, keeping memory usage low.
+    """
+
+    def __init__(self, x_path, y_path):
+        self.X = np.load(x_path, mmap_mode="r")
+        self.y = np.load(y_path, mmap_mode="r")
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return (
+            torch.tensor(self.X[idx], dtype=torch.float32),
+            torch.tensor(self.y[idx], dtype=torch.float32),
+        )
+
+
+def _make_loader(split_entry, batch_size, shuffle):
+    """Create a DataLoader from either (array, array, meta) or (x_path, y_path, meta)."""
+    x, y, meta = split_entry
+    if isinstance(x, str):
+        # Memmap datasets can't be pickled to worker processes on Windows,
+        # but num_workers=0 is fine since reads are already fast (OS page cache)
+        dataset = MemmapDataset(x, y)
+        return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle)
+    else:
+        dataset = StockDataset(x, y)
+        return DataLoader(
+            dataset, batch_size=batch_size, shuffle=shuffle,
+            num_workers=NUM_WORKERS, persistent_workers=True,
+        )
 
 
 # ──────────────────────────────────────────────
@@ -185,6 +222,31 @@ class EarlyStopping:
 # Training
 # ──────────────────────────────────────────────
 
+def _save_checkpoint(path, model, optimizer, scheduler, stopper, epoch):
+    """Save training state to a checkpoint file."""
+    torch.save({
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "best_loss": stopper.best_loss,
+        "stopper_counter": stopper.counter,
+        "stopper_best_state": stopper.best_state,
+    }, path)
+
+
+def _load_checkpoint(path, model, optimizer, scheduler, stopper, device):
+    """Load training state from a checkpoint file. Returns the starting epoch."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    model.load_state_dict(ckpt["model_state_dict"])
+    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+    stopper.best_loss = ckpt["best_loss"]
+    stopper.counter = ckpt["stopper_counter"]
+    stopper.best_state = ckpt["stopper_best_state"]
+    return ckpt["epoch"]
+
+
 def train_model(
     splits,
     batch_size=64,
@@ -192,25 +254,27 @@ def train_model(
     lr=1e-3,
     patience=10,
     device=None,
+    checkpoint_dir="checkpoints",
+    resume_from=None,
 ):
-    """Full training loop with validation monitoring and early stopping."""
+    """Full training loop with validation monitoring, early stopping, and checkpoints.
+
+    Args:
+        resume_from: Path to a checkpoint file, or "latest" to load
+                     checkpoint_dir/latest.pt. None starts from scratch.
+    """
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # DataLoaders
-    X_train, y_train, _ = splits["train"]
-    X_val, y_val, _ = splits["val"]
+    os.makedirs(checkpoint_dir, exist_ok=True)
 
-    train_loader = DataLoader(
-        StockDataset(X_train, y_train), batch_size=batch_size, shuffle=True,
-        num_workers=NUM_WORKERS, persistent_workers=True,
-    )
-    val_loader = DataLoader(
-        StockDataset(X_val, y_val), batch_size=batch_size, shuffle=False,
-        num_workers=NUM_WORKERS, persistent_workers=True,
-    )
+    # DataLoaders (works with both in-memory arrays and memmap file paths)
+    train_loader = _make_loader(splits["train"], batch_size, shuffle=True)
+    val_loader = _make_loader(splits["val"], batch_size, shuffle=False)
+    n_train = len(train_loader.dataset)
+    n_val = len(val_loader.dataset)
 
     # Model, loss, optimizer, scheduler
     model = StockPredictor().to(device)
@@ -221,13 +285,27 @@ def train_model(
     )
     stopper = EarlyStopping(patience=patience)
 
+    # Resume from checkpoint if requested
+    start_epoch = 1
+    if resume_from is not None:
+        if resume_from == "latest":
+            resume_from = os.path.join(checkpoint_dir, "latest.pt")
+        if os.path.exists(resume_from):
+            start_epoch = _load_checkpoint(
+                resume_from, model, optimizer, scheduler, stopper, device
+            ) + 1
+            print(f"Resumed from checkpoint — starting at epoch {start_epoch}")
+            print(f"  Best val loss so far: {stopper.best_loss:.8f}")
+        else:
+            print(f"No checkpoint found at {resume_from}, starting from scratch.")
+
     param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Model parameters: {param_count:,}")
-    print(f"Train: {len(X_train):,} | Val: {len(X_val):,} | Batch: {batch_size}")
+    print(f"Train: {n_train:,} | Val: {n_val:,} | Batch: {batch_size}")
     print(f"{'Epoch':>5}  {'Train Loss':>12}  {'Val Loss':>12}  {'LR':>10}")
     print("-" * 45)
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         # ── Train ──
         model.train()
         train_loss = 0.0
@@ -240,7 +318,7 @@ def train_model(
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item() * X_batch.size(0)
-        train_loss /= len(X_train)
+        train_loss /= n_train
 
         # ── Validate ──
         model.eval()
@@ -251,12 +329,24 @@ def train_model(
                 preds = model(X_batch)
                 loss = criterion(preds, y_batch)
                 val_loss += loss.item() * X_batch.size(0)
-        val_loss /= len(X_val)
+        val_loss /= n_val
 
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"{epoch:>5}  {train_loss:>12.8f}  {val_loss:>12.8f}  {current_lr:>10.6f}")
 
         scheduler.step(val_loss)
+
+        # Save checkpoint every epoch
+        _save_checkpoint(
+            os.path.join(checkpoint_dir, "latest.pt"),
+            model, optimizer, scheduler, stopper, epoch,
+        )
+        # Also save numbered checkpoint every 10 epochs
+        if epoch % 10 == 0:
+            _save_checkpoint(
+                os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt"),
+                model, optimizer, scheduler, stopper, epoch,
+            )
 
         if stopper.step(val_loss, model):
             break
@@ -277,11 +367,9 @@ def evaluate(model, splits, device=None):
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    X_test, y_test, meta = splits["test"]
-    test_loader = DataLoader(
-        StockDataset(X_test, y_test), batch_size=64, shuffle=False,
-        num_workers=NUM_WORKERS, persistent_workers=True,
-    )
+    meta = splits["test"][2]
+    test_loader = _make_loader(splits["test"], batch_size=64, shuffle=False)
+    n_test = len(test_loader.dataset)
 
     model.eval()
     all_preds, all_targets = [], []
@@ -306,7 +394,7 @@ def evaluate(model, splits, device=None):
     dir_accuracy = (pred_dir == true_dir).mean()
 
     date_range = f"{meta[0]['date']} to {meta[-1]['date']}"
-    print(f"\nTest Results ({len(X_test):,} samples, {date_range}):")
+    print(f"\nTest Results ({n_test:,} samples, {date_range}):")
     print(f"  Close return MSE:       {mse_close:.8f}")
     print(f"  Dividend yield MSE:     {mse_div:.10f}")
     print(f"  Direction accuracy:     {dir_accuracy:.2%}")
@@ -320,15 +408,28 @@ def evaluate(model, splits, device=None):
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
+    resume = "--resume" in sys.argv
+    chunked = "--chunked" in sys.argv
+
     print("=" * 50)
     print("  Stock Prediction Model")
+    if resume:
+        print("  (resuming from checkpoint)")
+    if chunked:
+        print("  (chunked data loading)")
     print("=" * 50)
 
     print("\n[1/3] Preparing data...")
-    splits, scalers = prepare_data()
+    if chunked:
+        splits, scalers = prepare_data_chunked()
+    else:
+        splits, scalers = prepare_data()
 
     print("\n[2/3] Training model...")
-    model = train_model(splits, batch_size=32, epochs=100, patience=10)
+    model = train_model(
+        splits, batch_size=32, epochs=100, patience=10,
+        resume_from="latest" if resume else None,
+    )
 
     print("\n[3/3] Evaluating on test set...")
     results = evaluate(model, splits)
