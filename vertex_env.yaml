@@ -1,0 +1,17 @@
+# Environment variables passed to the Vertex AI training container.
+# Edit these values before running: gcloud builds submit --config cloudbuild.yaml
+#
+# GCS_BUCKET is the only required field — set it to your bucket name (no gs://).
+
+GCS_BUCKET: "stocks-nn-project-2b08a31c"
+SP500_PATH: "gs://stocks-nn-project-2b08a31c/data/sp500_history.csv"
+MACRO_PATH: "gs://stocks-nn-project-2b08a31c/data/macro_history.csv"
+GCS_OUTPUT_PREFIX: "output/v1"
+CHUNKED: "1"
+RESUME: "0"
+EPOCHS: "100"
+BATCH_SIZE: "64"
+LR: "0.001"
+PATIENCE: "10"
+CHUNK_DIR: "/tmp/data_chunks"
+CHECKPOINT_DIR: "/tmp/checkpoints"

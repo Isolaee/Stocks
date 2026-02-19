@@ -1,0 +1,11 @@
+# Cloud training requirements
+# torch/torchvision come from the base Docker image (pytorch/pytorch)
+# so we only list the additional packages needed.
+
+yfinance>=0.2
+pandas>=2.0
+numpy>=1.26
+scikit-learn>=1.4        # MinMaxScaler used in preprocess.py
+matplotlib>=3.8
+lxml>=5.0
+google-cloud-storage>=2.16

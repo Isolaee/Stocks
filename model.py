@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from preprocess import prepare_data, prepare_data_chunked, WINDOW_SIZE, FEATURE_COLS
+from gcs import upload_file
 
 # Intra-op parallelism: use all cores for matrix ops (LSTM, attention, etc.)
 torch.set_num_threads(os.cpu_count() or 4)
@@ -223,7 +224,7 @@ class EarlyStopping:
 # ──────────────────────────────────────────────
 
 def _save_checkpoint(path, model, optimizer, scheduler, stopper, epoch):
-    """Save training state to a checkpoint file."""
+    """Save training state to a checkpoint file, then mirror to GCS if configured."""
     torch.save({
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
@@ -233,6 +234,12 @@ def _save_checkpoint(path, model, optimizer, scheduler, stopper, epoch):
         "stopper_counter": stopper.counter,
         "stopper_best_state": stopper.best_state,
     }, path)
+    # Mirror to GCS so the checkpoint survives VM preemption
+    gcs_bucket = os.environ.get("GCS_BUCKET", "")
+    gcs_prefix = os.environ.get("GCS_OUTPUT_PREFIX", "checkpoints")
+    if gcs_bucket:
+        gcs_dest = f"gs://{gcs_bucket}/{gcs_prefix}/{os.path.basename(path)}"
+        upload_file(path, gcs_dest)
 
 
 def _load_checkpoint(path, model, optimizer, scheduler, stopper, device):
@@ -434,7 +441,11 @@ if __name__ == "__main__":
     print("\n[3/3] Evaluating on test set...")
     results = evaluate(model, splits)
 
-    # Save model weights
+    # Save model weights locally then upload to GCS if configured
     save_path = "model_weights.pth"
     torch.save(model.state_dict(), save_path)
     print(f"\nModel saved to {save_path}")
+    gcs_bucket = os.environ.get("GCS_BUCKET", "")
+    gcs_prefix = os.environ.get("GCS_OUTPUT_PREFIX", "checkpoints")
+    if gcs_bucket:
+        upload_file(save_path, f"gs://{gcs_bucket}/{gcs_prefix}/model_weights.pth")

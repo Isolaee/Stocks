@@ -3,6 +3,7 @@ import pickle
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
+from gcs import resolve, resolve_dir
 
 
 # Features selected based on correlation analysis (corr_close_avg.csv)
@@ -38,9 +39,11 @@ MACRO_COLS = ["VIX", "SP500_Return", "Treasury_10Y", "USD_Index"]
 WINDOW_SIZE = 90
 
 
-def load_macro(macro_path="macro_history.csv"):
+def load_macro(macro_path=None):
     """Load macro indicator CSV (VIX, SP500_Return, Treasury_10Y, USD_Index)."""
-    macro = pd.read_csv(macro_path)
+    if macro_path is None:
+        macro_path = os.environ.get("MACRO_PATH", "macro_history.csv")
+    macro = pd.read_csv(resolve(macro_path))
     macro["Date"] = pd.to_datetime(macro["Date"], utc=True)
     macro = macro.set_index("Date")
     # Ensure no gaps — forward-fill missing trading days
@@ -48,9 +51,11 @@ def load_macro(macro_path="macro_history.csv"):
     return macro
 
 
-def load_and_enrich(csv_path="sp500_history.csv", macro_path="macro_history.csv"):
+def load_and_enrich(csv_path=None, macro_path=None):
     """Load raw CSV, add derived features per stock, and merge macro data."""
-    df = pd.read_csv(csv_path)
+    if csv_path is None:
+        csv_path = os.environ.get("SP500_PATH", "sp500_history.csv")
+    df = pd.read_csv(resolve(csv_path))
     df["Date"] = pd.to_datetime(df["Date"], utc=True)
     macro = load_macro(macro_path)
     enriched = []
@@ -215,7 +220,7 @@ def train_val_test_split(X, y, meta, train_ratio=0.7, val_ratio=0.15):
     return splits
 
 
-def prepare_data(csv_path="sp500_history.csv", macro_path="macro_history.csv"):
+def prepare_data(csv_path=None, macro_path=None):
     """Full pipeline: load → enrich → merge macro → normalize → window → split.
 
     Returns dict with train/val/test splits, each containing (X, y, meta).
@@ -297,9 +302,9 @@ def _enrich_symbol_group(group):
 
 
 def prepare_data_chunked(
-    csv_path="sp500_history.csv",
-    macro_path="macro_history.csv",
-    chunk_dir="data_chunks",
+    csv_path=None,
+    macro_path=None,
+    chunk_dir=None,
     chunk_size=50,
     train_ratio=0.7,
     val_ratio=0.15,
@@ -314,13 +319,20 @@ def prepare_data_chunked(
         splits: dict with train/val/test, each containing (X, y, meta)
         scalers: dict of fitted scalers
     """
+    if csv_path is None:
+        csv_path = os.environ.get("SP500_PATH", "sp500_history.csv")
+    if macro_path is None:
+        macro_path = os.environ.get("MACRO_PATH", "macro_history.csv")
+    if chunk_dir is None:
+        chunk_dir = os.environ.get("CHUNK_DIR", "data_chunks")
+
     os.makedirs(chunk_dir, exist_ok=True)
 
     # Load macro data once (small)
     macro = load_macro(macro_path)
 
     # Read only the Symbol column to get the full list without loading everything
-    all_symbols = pd.read_csv(csv_path, usecols=["Symbol"])["Symbol"].unique()
+    all_symbols = pd.read_csv(resolve(csv_path), usecols=["Symbol"])["Symbol"].unique()
     symbol_chunks = [
         all_symbols[i:i + chunk_size]
         for i in range(0, len(all_symbols), chunk_size)
@@ -334,7 +346,7 @@ def prepare_data_chunked(
         print(f"  Chunk {ci + 1}/{len(symbol_chunks)} ({len(symbols)} symbols)...")
 
         # Read only rows for this chunk's symbols
-        df_raw = pd.read_csv(csv_path)
+        df_raw = pd.read_csv(resolve(csv_path))
         df_raw["Date"] = pd.to_datetime(df_raw["Date"], utc=True)
         df_chunk = df_raw[df_raw["Symbol"].isin(symbols)]
         del df_raw

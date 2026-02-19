@@ -1,0 +1,104 @@
+# Cloud Build pipeline: build Docker image → push to Artifact Registry → submit Vertex AI training job
+#
+# Prerequisites (run once):
+#   gcloud artifacts repositories create stocks-nn \
+#     --repository-format=docker \
+#     --location=europe-west4 \
+#     --description="Stocks NN training images"
+#
+# Trigger this build:
+#   gcloud builds submit --config cloudbuild.yaml \
+#     --substitutions _GCS_BUCKET=my-stocks-nn,_RUN_ID=v1
+#
+# Required substitution variables:
+#   _GCS_BUCKET       GCS bucket name (without gs://), e.g. "my-stocks-nn"
+#
+# Optional substitution variables (have sensible defaults):
+#   _RUN_ID           Tag for this training run, used as image tag and GCS prefix. Default: "latest"
+#   _REGION           GCP region. Default: "us-central1"
+#   _MACHINE_TYPE     Vertex AI machine type. Default: "n1-standard-8"
+#   _ACCELERATOR      GPU type. Default: "NVIDIA_TESLA_T4"
+# Training hyperparameters (EPOCHS, BATCH_SIZE, etc.) are set in vertex_env.yaml
+
+substitutions:
+  _RUN_ID: "latest"
+  _REGION: "europe-west4"
+  _MACHINE_TYPE: "n1-standard-8"
+  _ACCELERATOR: "NVIDIA_TESLA_T4"
+
+# Reusable image tag
+tags:
+  - stocks-nn
+  - $_RUN_ID
+
+steps:
+  # ── Step 1: Build the training Docker image ──────────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: build
+    args:
+      - build
+      - -t
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/stocks-nn/trainer:${_RUN_ID}"
+      - -f
+      - Dockerfile
+      - .
+
+  # ── Step 2: Push image to Artifact Registry ───────────────────────────────────
+  - name: "gcr.io/cloud-builders/docker"
+    id: push
+    waitFor: [build]
+    args:
+      - push
+      - "${_REGION}-docker.pkg.dev/$PROJECT_ID/stocks-nn/trainer:${_RUN_ID}"
+
+  # ── Step 3: Submit Vertex AI custom training job ──────────────────────────────
+  - name: "gcr.io/google.com/cloudsdktool/cloud-sdk"
+    id: train
+    waitFor: [push]
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        gcloud ai custom-jobs create \
+          --region=${_REGION} \
+          --display-name=stocks-nn-${_RUN_ID} \
+          --labels=run_id=${_RUN_ID} \
+          --config=- <<EOF
+        workerPoolSpecs:
+          - machineSpec:
+              machineType: ${_MACHINE_TYPE}
+            replicaCount: 1
+            containerSpec:
+              imageUri: ${_REGION}-docker.pkg.dev/$PROJECT_ID/stocks-nn/trainer:${_RUN_ID}
+              env:
+                - name: GCS_BUCKET
+                  value: "stocks-nn-project-2b08a31c"
+                - name: SP500_PATH
+                  value: "gs://stocks-nn-project-2b08a31c/data/sp500_history.csv"
+                - name: MACRO_PATH
+                  value: "gs://stocks-nn-project-2b08a31c/data/macro_history.csv"
+                - name: GCS_OUTPUT_PREFIX
+                  value: "output/${_RUN_ID}"
+                - name: CHUNKED
+                  value: "1"
+                - name: RESUME
+                  value: "0"
+                - name: EPOCHS
+                  value: "3"
+                - name: BATCH_SIZE
+                  value: "64"
+                - name: LR
+                  value: "0.001"
+                - name: PATIENCE
+                  value: "10"
+        EOF
+
+# Push the built image to Artifact Registry
+images:
+  - "${_REGION}-docker.pkg.dev/$PROJECT_ID/stocks-nn/trainer:${_RUN_ID}"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  # Use a machine with enough disk space to build the PyTorch image
+  machineType: "E2_HIGHCPU_8"
+  substitutionOption: ALLOW_LOOSE
